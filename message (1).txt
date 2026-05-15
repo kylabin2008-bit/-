@@ -1,0 +1,744 @@
+import sys
+import sqlite3
+import secrets
+import hashlib
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+# ---------------------------- CONFIG ----------------------------
+DB_FILE = Path(__file__).with_name('messenger.db')
+MAX_WORDS = 500
+DEFAULT_ADMIN_USERNAME = 'admin'
+DEFAULT_ADMIN_PASSWORD = 'admin123'
+PBKDF2_ITERATIONS = 200_000
+SALT_BYTES = 16
+
+BANNED_WORDS = ['дурак', 'идиот', 'сука', 'блять', 'хуй', 'пидор', 'idiot', 'stupid']
+
+# ---------------------------- UTILS / DB ----------------------------
+# (Оставляем функции now_iso, word_count, enforce_word_limit, contains_banned_words, 
+#  hash_password, verify_password, generate_temp_password и класс DB без изменений, 
+#  так как логика ядра должна остаться прежней)
+
+def now_iso() -> str:
+    """Возвращает текущее время в формате ISO 8601 с учетом часового пояса UTC."""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+
+def word_count(text: str) -> int:
+    """Подсчитывает количество слов в переданном тексте."""
+    return len(re.findall(r'\S+', text.strip()))
+
+def enforce_word_limit(text: str):
+    """Проверяет длину текста. Вызывает ошибку, если превышен лимит слов."""
+    wc = word_count(text)
+    if wc > MAX_WORDS:
+        raise ValueError(f'Слишком много слов: {wc}. Максимум: {MAX_WORDS}.')
+
+def contains_banned_words(text: str) -> bool:
+    """Проверяет, содержит ли текст запрещенные слова (мат) из списка BANNED_WORDS."""
+    lowered = text.lower()
+    for w in BANNED_WORDS:
+        pattern = rf"\b{re.escape(w.lower())}\b"
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return True
+    return False
+
+@dataclass
+class PasswordRecord:
+    salt: bytes
+    pw_hash: bytes
+
+def hash_password(password: str) -> PasswordRecord:
+    """Генерирует уникальную 'соль' и создает безопасный хэш пароля (алгоритм PBKDF2)."""
+    salt = secrets.token_bytes(SALT_BYTES)
+    pw_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, PBKDF2_ITERATIONS)
+    return PasswordRecord(salt=salt, pw_hash=pw_hash)
+
+def verify_password(password: str, salt: bytes, pw_hash: bytes) -> bool:
+    """Сравнивает введенный пароль с сохраненным хэшем для проверки подлинности."""
+    check = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, PBKDF2_ITERATIONS)
+    return secrets.compare_digest(check, pw_hash)
+
+def generate_temp_password(length: int = 12) -> str:
+    """Генерирует случайный временный пароль заданной длины из безопасного набора символов."""
+    alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+class DB:
+    def __init__(self, path: Path):
+        """Инициализирует подключение к базе данных SQLite и создает таблицы, если их нет."""
+        self.path = path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        self._init_db()
+        self.ensure_default_admin()
+
+    def close(self):
+        """Закрывает соединение с базой данных."""
+        self.conn.close()
+
+    def _init_db(self):
+        """Создает структуру таблиц (пользователи, группы, сообщения, тикеты)."""
+        cur = self.conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                salt BLOB NOT NULL,
+                pw_hash BLOB NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                owner_id INTEGER NOT NULL,
+                join_code TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE
+            );''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS group_members (
+                user_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, group_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE CASCADE
+            );''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS direct_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER NOT NULL,
+                recipient_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                flagged INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'VISIBLE',
+                moderation_note TEXT,
+                moderated_by INTEGER,
+                moderated_at TEXT,
+                FOREIGN KEY(sender_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(recipient_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(moderated_by) REFERENCES users(id) ON DELETE SET NULL
+            );''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                flagged INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'VISIBLE',
+                moderation_note TEXT,
+                moderated_by INTEGER,
+                moderated_at TEXT,
+                FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE CASCADE,
+                FOREIGN KEY(sender_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(moderated_by) REFERENCES users(id) ON DELETE SET NULL
+            );''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                admin_reply TEXT,
+                replied_at TEXT,
+                admin_id INTEGER,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(admin_id) REFERENCES users(id) ON DELETE SET NULL
+            );''')
+        self.conn.commit()
+
+    def ensure_default_admin(self):
+        """Создает учетную запись администратора по умолчанию, если она отсутствует."""
+        u = self.get_user_by_username(DEFAULT_ADMIN_USERNAME)
+        if u:
+            if not u['is_admin']:
+                self.conn.execute('UPDATE users SET is_admin=1 WHERE id=?', (u['id'],))
+                self.conn.commit()
+            return
+        rec = hash_password(DEFAULT_ADMIN_PASSWORD)
+        self.conn.execute('INSERT INTO users(username, salt, pw_hash, is_admin, created_at) VALUES (?,?,?,?,?)',
+            (DEFAULT_ADMIN_USERNAME, rec.salt, rec.pw_hash, 1, now_iso()))
+        self.conn.commit()
+
+    def create_user_explicit(self, username: str, salt: bytes, pw_hash: bytes) -> int:
+        """Регистрирует нового пользователя в базе данных и возвращает его ID."""
+        cur = self.conn.execute('INSERT INTO users(username, salt, pw_hash, is_admin, created_at) VALUES (?,?,?,?,?)',
+            (username, salt, pw_hash, 0, now_iso()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_user_by_username(self, username: str):
+        """Находит пользователя в базе данных по его логину."""
+        return self.conn.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+
+    def get_user_by_id(self, user_id: int):
+        """Находит пользователя в базе данных по его уникальному ID."""
+        return self.conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+
+    def list_users(self):
+        """Возвращает список всех зарегистрированных пользователей системы."""
+        return self.conn.execute('SELECT id, username, is_admin FROM users ORDER BY username').fetchall()
+
+    def change_password(self, user_id: int, new_password: str):
+        """Обновляет хэш и соль пароля для указанного пользователя."""
+        rec = hash_password(new_password)
+        self.conn.execute('UPDATE users SET salt=?, pw_hash=? WHERE id=?', (rec.salt, rec.pw_hash, user_id))
+        self.conn.commit()
+
+    def create_group(self, owner_id: int, name: str) -> int:
+        """Создает новую группу бесед и назначает пользователя ее владельцем."""
+        code = secrets.token_hex(4)
+        cur = self.conn.execute('INSERT INTO groups(name, owner_id, join_code, created_at) VALUES (?,?,?,?)',
+                            (name, owner_id, code, now_iso()))
+        gid = int(cur.lastrowid)
+        self.conn.execute('INSERT INTO group_members(user_id, group_id, role, joined_at) VALUES (?,?,?,?)',
+                        (owner_id, gid, 'owner', now_iso()))
+        self.conn.commit()
+        return gid
+
+    def list_my_groups(self, user_id: int):
+        """Возвращает список всех групп, в которых состоит пользователь."""
+        return self.conn.execute(
+            'SELECT g.id, g.name, g.join_code, gm.role FROM groups g JOIN group_members gm ON gm.group_id=g.id WHERE gm.user_id=? ORDER BY g.name',
+            (user_id,)
+        ).fetchall()
+
+    def join_group(self, user_id: int, code: str) -> int:
+        """Добавляет пользователя в группу, используя код приглашения."""
+        g = self.conn.execute('SELECT * FROM groups WHERE join_code=?', (code,)).fetchone()
+        if not g: raise ValueError('Группа не найдена.')
+        gid = int(g['id'])
+        self.conn.execute('INSERT OR IGNORE INTO group_members(user_id, group_id, role, joined_at) VALUES (?,?,?,?)',
+                        (user_id, gid, 'member', now_iso()))
+        self.conn.commit()
+        return gid
+
+    def leave_group(self, user_id: int, group_id: int):
+        """Удаляет пользователя из участников группы."""
+        self.conn.execute('DELETE FROM group_members WHERE user_id=? AND group_id=?', (user_id, group_id))
+        self.conn.commit()
+
+    def send_direct(self, sender_id: int, recipient_id: int, content: str) -> int:
+        """Отправляет личное сообщение. Если содержит мат — помечает для модерации."""
+        enforce_word_limit(content)
+        flagged = 1 if contains_banned_words(content) else 0
+        status = 'PENDING' if flagged else 'VISIBLE'
+        cur = self.conn.execute('INSERT INTO direct_messages(sender_id, recipient_id, content, created_at, flagged, status) VALUES (?,?,?,?,?,?)',
+            (sender_id, recipient_id, content, now_iso(), flagged, status))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def send_group(self, sender_id: int, group_id: int, content: str) -> int:
+        """Отправляет сообщение в группу. Если содержит мат — скрывает до проверки."""
+        enforce_word_limit(content)
+        flagged = 1 if contains_banned_words(content) else 0
+        status = 'PENDING' if flagged else 'VISIBLE'
+        cur = self.conn.execute('INSERT INTO group_messages(group_id, sender_id, content, created_at, flagged, status) VALUES (?,?,?,?,?,?)',
+            (group_id, sender_id, content, now_iso(), flagged, status))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_chat_history(self, user_id: int, other_id: int):
+        """Извлекает историю переписки между двумя пользователями (исключая удаленные сообщения)."""
+        return self.conn.execute('''
+            SELECT sender_id, content, created_at, status FROM direct_messages 
+            WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))
+            AND (status='VISIBLE' OR sender_id=?)
+            ORDER BY created_at ASC
+        ''', (user_id, other_id, other_id, user_id, user_id)).fetchall()
+
+    def get_group_history(self, group_id: int, user_id: int):
+        """Извлекает историю сообщений группы, доступных указанному пользователю."""
+        return self.conn.execute('''
+            SELECT gm.sender_id, u.username as sender_name, gm.content, gm.created_at, gm.status 
+            FROM group_messages gm JOIN users u ON u.id = gm.sender_id
+            WHERE gm.group_id=? AND (gm.status='VISIBLE' OR gm.sender_id=?)
+            ORDER BY gm.created_at ASC
+        ''', (group_id, user_id)).fetchall()
+
+    def moderation_queue(self):
+        """Возвращает список сообщений (личных и групповых), помеченных системой для ручной проверки."""
+        return self.conn.execute('''
+            SELECT 'direct' AS kind, dm.id AS msg_id, dm.created_at AS created_at, dm.content, su.username AS sender, ru.username AS target
+            FROM direct_messages dm JOIN users su ON su.id = dm.sender_id JOIN users ru ON ru.id = dm.recipient_id
+            WHERE dm.flagged=1 AND dm.status='PENDING'
+            UNION ALL
+            SELECT 'group' AS kind, gm.id AS msg_id, gm.created_at AS created_at, gm.content, su.username AS sender, g.name AS target
+            FROM group_messages gm JOIN users su ON su.id = gm.sender_id JOIN groups g ON g.id = gm.group_id
+            WHERE gm.flagged=1 AND gm.status='PENDING'
+            ORDER BY created_at ASC
+        ''').fetchall()
+
+    def moderate_message(self, admin_id: int, kind: str, msg_id: int, action: str, note: str | None = None):
+        """Одобряет (APPROVE) или удаляет (DELETED) сообщение, находящееся на модерации."""
+        table = 'direct_messages' if kind == 'direct' else 'group_messages'
+        status = 'VISIBLE' if action == 'APPROVE' else 'DELETED'
+        self.conn.execute(f"UPDATE {table} SET status=?, moderation_note=?, moderated_by=?, moderated_at=? WHERE id=?",
+                        (status, note, admin_id, now_iso(), msg_id))
+        self.conn.commit()
+
+    def create_ticket(self, user_id: int, subject: str, message: str):
+        """Создает новый запрос от пользователя в службу технической поддержки."""
+        self.conn.execute('INSERT INTO support_tickets(user_id, subject, message, created_at, status) VALUES (?,?,?,?, "OPEN")',
+            (user_id, subject, message, now_iso()))
+        self.conn.commit()
+
+    def list_my_tickets(self, user_id: int):
+        """Возвращает историю запросов пользователя в техподдержку."""
+        return self.conn.execute('SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_at DESC', (user_id,)).fetchall()
+
+    def admin_list_open_tickets(self):
+        """Возвращает список всех нерешенных запросов в поддержку для администратора."""
+        return self.conn.execute('SELECT t.*, u.username FROM support_tickets t JOIN users u ON u.id = t.user_id WHERE t.status="OPEN"').fetchall()
+
+    def admin_reply_ticket(self, admin_id: int, ticket_id: int, reply: str):
+        """Публикует ответ администратора в тикет и переводит его в статус 'Закрыто'."""
+        self.conn.execute('UPDATE support_tickets SET status="CLOSED", admin_reply=?, replied_at=?, admin_id=? WHERE id=?',
+            (reply, now_iso(), admin_id, ticket_id))
+        self.conn.commit()
+
+# ---------------------------- UI WIDGETS ----------------------------
+
+class ChatBubble(QtWidgets.QFrame):
+    def __init__(self, text, time, is_mine, sender_name=None):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        self.setContentsMargins(5, 5, 5, 5)
+        
+        if sender_name and not is_mine:
+            name_lbl = QtWidgets.QLabel(sender_name)
+            name_lbl.setStyleSheet("font-weight: bold; color: #00a884; font-size: 11px;")
+            layout.addWidget(name_lbl)
+
+        msg_lbl = QtWidgets.QLabel(text)
+        msg_lbl.setWordWrap(True)
+        layout.addWidget(msg_lbl)
+
+        time_lbl = QtWidgets.QLabel(time[-8:-3]) # HH:MM
+        time_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        time_lbl.setStyleSheet("font-size: 10px; color: rgba(255,255,255,0.5);")
+        layout.addWidget(time_lbl)
+
+        color = "#005c4b" if is_mine else "#202c33"
+        align = QtCore.Qt.AlignmentFlag.AlignRight if is_mine else QtCore.Qt.AlignmentFlag.AlignLeft
+        
+        self.setStyleSheet(f"""
+            ChatBubble {{
+                background-color: {color};
+                border-radius: 10px;
+                color: white;
+                margin: 5px;
+            }}
+        """)
+        self.setMaximumWidth(400)
+
+class AuthWorker(QtCore.QThread):
+    finished = QtCore.Signal(bool, object)
+    def __init__(self, db: DB, action: str, username: str, password: str):
+        super().__init__()
+        self.db, self.action, self.username, self.password = db, action, username, password
+    def run(self):
+        """Выполняет авторизацию или регистрацию в фоновом потоке, чтобы интерфейс не зависал."""
+        try:
+            if self.action == 'login':
+                u = self.db.get_user_by_username(self.username)
+                if u and verify_password(self.password, u['salt'], u['pw_hash']):
+                    self.finished.emit(True, int(u['id']))
+                else: self.finished.emit(False, 'Неверный логин или пароль.')
+            else:
+                if self.db.get_user_by_username(self.username): self.finished.emit(False, 'Уже существует.')
+                else:
+                    rec = hash_password(self.password)
+                    uid = self.db.create_user_explicit(self.username, rec.salt, rec.pw_hash)
+                    self.finished.emit(True, uid)
+        except Exception as e: self.finished.emit(False, str(e))
+
+# ---------------------------- MAIN PAGES ----------------------------
+
+class AuthPage(QtWidgets.QWidget):
+    logged_in = QtCore.Signal(int)
+    def __init__(self, db: DB):
+        super().__init__()
+        self.db = db
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        
+        card = QtWidgets.QFrame()
+        card.setObjectName("AuthCard")
+        card.setFixedWidth(350)
+        card_lay = QtWidgets.QVBoxLayout(card)
+        
+        title = QtWidgets.QLabel("WhatsApp 2.0")
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #00a884; margin-bottom: 20px;")
+        title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        card_lay.addWidget(title)
+
+        self.u = QtWidgets.QLineEdit(); self.u.setPlaceholderText("Имя пользователя")
+        self.p = QtWidgets.QLineEdit(); self.p.setPlaceholderText("Пароль")
+        self.p.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        
+        self.btn_l = QtWidgets.QPushButton("ВОЙТИ")
+        self.btn_r = QtWidgets.QPushButton("РЕГИСТРАЦИЯ")
+        self.btn_r.setStyleSheet("background: transparent; color: #00a884; border: 1px solid #00a884;")
+
+        card_lay.addWidget(self.u); card_lay.addWidget(self.p)
+        card_lay.addWidget(self.btn_l); card_lay.addWidget(self.btn_r)
+        lay.addWidget(card)
+
+        self.btn_l.clicked.connect(lambda: self.start_auth('login'))
+        self.btn_r.clicked.connect(lambda: self.start_auth('reg'))
+
+    def start_auth(self, act):
+        self.worker = AuthWorker(self.db, act, self.u.text(), self.p.text())
+        self.worker.finished.connect(self.on_fin)
+        self.worker.start()
+
+    def on_fin(self, ok, data):
+        if ok: self.logged_in.emit(data)
+        else: QtWidgets.QMessageBox.critical(self, "Ошибка", str(data))
+
+class UserHomePage(QtWidgets.QWidget):
+    logout = QtCore.Signal()
+    def __init__(self, db: DB):
+        super().__init__()
+        self.db = db
+        self.user_id = None
+        self.active_chat = None # ('user', id) или ('group', id)
+
+        main_lay = QtWidgets.QHBoxLayout(self)
+        main_lay.setContentsMargins(0,0,0,0)
+        main_lay.setSpacing(0)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+
+        # --- SIDEBAR ---
+        sidebar = QtWidgets.QWidget()
+        sidebar.setFixedWidth(350)
+        side_lay = QtWidgets.QVBoxLayout(sidebar)
+        side_lay.setContentsMargins(0,0,0,0)
+
+        # Sidebar Header
+        s_header = QtWidgets.QFrame()
+        s_header.setObjectName("SideHeader")
+        sh_lay = QtWidgets.QHBoxLayout(s_header)
+        self.lbl_me = QtWidgets.QLabel("Я")
+        btn_add = QtWidgets.QPushButton("+")
+        btn_add.setFixedWidth(40)
+        btn_add.clicked.connect(self.show_add_menu)
+        btn_out = QtWidgets.QPushButton("🚪")
+        btn_out.setFixedWidth(40)
+        btn_out.clicked.connect(self.logout.emit)
+        sh_lay.addWidget(self.lbl_me); sh_lay.addStretch(); sh_lay.addWidget(btn_add); sh_lay.addWidget(btn_out)
+        side_lay.addWidget(s_header)
+
+        # Chat List
+        self.chat_list = QtWidgets.QListWidget()
+        self.chat_list.setObjectName("ChatList")
+        self.chat_list.itemClicked.connect(self.on_chat_selected)
+        side_lay.addWidget(self.chat_list)
+        
+        # Support Button at bottom
+        btn_sup = QtWidgets.QPushButton("Служба поддержки / Тикеты")
+        btn_sup.clicked.connect(self.open_support)
+        side_lay.addWidget(btn_sup)
+
+        # --- CHAT AREA ---
+        self.chat_area = QtWidgets.QWidget()
+        self.chat_lay = QtWidgets.QVBoxLayout(self.chat_area)
+        self.chat_lay.setContentsMargins(0,0,0,0)
+
+        # Chat Header
+        self.c_header = QtWidgets.QFrame()
+        self.c_header.setObjectName("ChatHeader")
+        self.c_header.setFixedHeight(60)
+        ch_lay = QtWidgets.QHBoxLayout(self.c_header)
+        self.lbl_chat_name = QtWidgets.QLabel("Выберите чат")
+        self.lbl_chat_name.setStyleSheet("font-weight: bold; font-size: 16px;")
+        ch_lay.addWidget(self.lbl_chat_name)
+        self.chat_lay.addWidget(self.c_header)
+
+        # Messages Scroll
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setObjectName("MsgScroll")
+        self.scroll_content = QtWidgets.QWidget()
+        self.msg_lay = QtWidgets.QVBoxLayout(self.scroll_content)
+        self.msg_lay.addStretch()
+        self.scroll.setWidget(self.scroll_content)
+        self.chat_lay.addWidget(self.scroll)
+
+        # Input Area
+        input_bar = QtWidgets.QFrame()
+        input_bar.setObjectName("InputBar")
+        ib_lay = QtWidgets.QHBoxLayout(input_bar)
+        self.msg_input = QtWidgets.QLineEdit()
+        self.msg_input.setPlaceholderText("Введите сообщение")
+        self.msg_input.returnPressed.connect(self.send_msg)
+        btn_send = QtWidgets.QPushButton("➤")
+        btn_send.setFixedWidth(50)
+        btn_send.clicked.connect(self.send_msg)
+        ib_lay.addWidget(self.msg_input); ib_lay.addWidget(btn_send)
+        self.chat_lay.addWidget(input_bar)
+
+        splitter.addWidget(sidebar)
+        splitter.addWidget(self.chat_area)
+        main_lay.addWidget(splitter)
+
+        # Таймер для автообновления сообщений
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.refresh_messages)
+        self.timer.start(3000)
+
+    def set_user(self, uid):
+        self.user_id = uid
+        u = self.db.get_user_by_id(uid)
+        self.lbl_me.setText(u['username'])
+        self.refresh_chats()
+
+    def refresh_chats(self):
+        """Обновляет боковую панель со списками групп и пользователей."""
+        self.chat_list.clear()
+        # Группы
+        for g in self.db.list_my_groups(self.user_id):
+            it = QtWidgets.QListWidgetItem(f"👥 {g['name']}")
+            it.setData(QtCore.Qt.ItemDataRole.UserRole, ('group', g['id']))
+            self.chat_list.addItem(it)
+        # Люди
+        for u in self.db.list_users():
+            if u['id'] != self.user_id:
+                it = QtWidgets.QListWidgetItem(f"👤 {u['username']}")
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, ('user', u['id']))
+                self.chat_list.addItem(it)
+
+    def on_chat_selected(self, item):
+        self.active_chat = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        self.lbl_chat_name.setText(item.text())
+        self.refresh_messages()
+
+    def refresh_messages(self):
+        """Загружает историю переписки для открытого в данный момент чата."""
+        if not self.active_chat: return
+        
+        # Очистка старых
+        for i in reversed(range(self.msg_lay.count())):
+            w = self.msg_lay.itemAt(i).widget()
+            if w: w.setParent(None)
+        self.msg_lay.addStretch()
+
+        ctype, cid = self.active_chat
+        if ctype == 'user':
+            msgs = self.db.get_chat_history(self.user_id, cid)
+            for m in msgs:
+                is_mine = m['sender_id'] == self.user_id
+                txt = m['content'] if m['status'] != 'DELETED' else "[Удалено модератором]"
+                bubble = ChatBubble(txt, m['created_at'], is_mine)
+                self.msg_lay.insertWidget(self.msg_lay.count()-1, bubble, alignment=QtCore.Qt.AlignmentFlag.AlignRight if is_mine else QtCore.Qt.AlignmentFlag.AlignLeft)
+        else:
+            msgs = self.db.get_group_history(cid, self.user_id)
+            for m in msgs:
+                is_mine = m['sender_id'] == self.user_id
+                txt = m['content'] if m['status'] != 'DELETED' else "[Удалено модератором]"
+                bubble = ChatBubble(txt, m['created_at'], is_mine, m['sender_name'])
+                self.msg_lay.insertWidget(self.msg_lay.count()-1, bubble, alignment=QtCore.Qt.AlignmentFlag.AlignRight if is_mine else QtCore.Qt.AlignmentFlag.AlignLeft)
+        
+        QtCore.QTimer.singleShot(100, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+
+    def send_msg(self):
+        txt = self.msg_input.text().strip()
+        if not txt or not self.active_chat: return
+        try:
+            ctype, cid = self.active_chat
+            if ctype == 'user': self.db.send_direct(self.user_id, cid, txt)
+            else: self.db.send_group(self.user_id, cid, txt)
+            self.msg_input.clear()
+            self.refresh_messages()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", str(e))
+
+    def show_add_menu(self):
+        m = QtWidgets.QMenu(self)
+        a1 = m.addAction("Создать группу")
+        a2 = m.addAction("Вступить по коду")
+        act = m.exec(QtGui.QCursor.pos())
+        if act == a1:
+            name, ok = QtWidgets.QInputDialog.getText(self, "Группа", "Название:")
+            if ok and name: self.db.create_group(self.user_id, name); self.refresh_chats()
+        elif act == a2:
+            code, ok = QtWidgets.QInputDialog.getText(self, "Вступить", "Код:")
+            if ok and code: 
+                try: self.db.join_group(self.user_id, code); self.refresh_chats()
+                except Exception as e: QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+
+    def open_support(self):
+        # Упрощенное окно поддержки
+        subj, ok = QtWidgets.QInputDialog.getText(self, "Поддержка", "Тема обращения:")
+        if ok and subj:
+            msg, ok2 = QtWidgets.QInputDialog.getMultiLineText(self, "Поддержка", "Ваше сообщение:")
+            if ok2 and msg:
+                self.db.create_ticket(self.user_id, subj, msg)
+                QtWidgets.QMessageBox.information(self, "Ок", "Тикет создан!")
+
+# ---------------------------- ADMIN PAGE ----------------------------
+
+class AdminHomePage(QtWidgets.QWidget):
+    logout = QtCore.Signal()
+    def __init__(self, db: DB):
+        super().__init__()
+        self.db = db
+        self.admin_id = None
+        lay = QtWidgets.QVBoxLayout(self)
+        
+        hdr = QtWidgets.QHBoxLayout()
+        hdr.addWidget(QtWidgets.QLabel("ПАНЕЛЬ МОДЕРАЦИИ"))
+        hdr.addStretch()
+        btn_ref = QtWidgets.QPushButton("Обновить")
+        btn_ref.clicked.connect(self.refresh)
+        btn_out = QtWidgets.QPushButton("Выйти")
+        btn_out.clicked.connect(self.logout.emit)
+        hdr.addWidget(btn_ref); hdr.addWidget(btn_out)
+        lay.addLayout(hdr)
+
+        self.tabs = QtWidgets.QTabWidget()
+        # Модерация
+        self.table_mod = QtWidgets.QTableWidget(0, 6)
+        self.table_mod.setHorizontalHeaderLabels(['Тип','ID','Когда','От','Куда','Текст'])
+        self.table_mod.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        mod_w = QtWidgets.QWidget(); ml = QtWidgets.QVBoxLayout(mod_w)
+        ml.addWidget(self.table_mod)
+        btns = QtWidgets.QHBoxLayout()
+        b_app = QtWidgets.QPushButton("Одобрить"); b_del = QtWidgets.QPushButton("Удалить")
+        b_app.clicked.connect(lambda: self.do_mod('APPROVE')); b_del.clicked.connect(lambda: self.do_mod('DELETE'))
+        btns.addWidget(b_app); btns.addWidget(b_del)
+        ml.addLayout(btns)
+        self.tabs.addTab(mod_w, "Модерация сообщений")
+
+        # Тикеты
+        self.table_tix = QtWidgets.QTableWidget(0, 4)
+        self.table_tix.setHorizontalHeaderLabels(['ID','Юзер','Тема','Сообщение'])
+        tix_w = QtWidgets.QWidget(); tl = QtWidgets.QVBoxLayout(tix_w)
+        tl.addWidget(self.table_tix)
+        btn_rep = QtWidgets.QPushButton("Ответить")
+        btn_rep.clicked.connect(self.reply_ticket)
+        tl.addWidget(btn_rep)
+        self.tabs.addTab(tix_w, "Тикеты поддержки")
+
+        lay.addWidget(self.tabs)
+
+    def set_admin(self, aid):
+        self.admin_id = aid
+        self.refresh()
+
+    def refresh(self):
+        """Обновляет таблицы с жалобами и обращениями в службу поддержки."""
+        # Сообщения
+        q = self.db.moderation_queue()
+        self.table_mod.setRowCount(0)
+        for r in q:
+            i = self.table_mod.rowCount(); self.table_mod.insertRow(i)
+            for c, v in enumerate(r): self.table_mod.setItem(i, c, QtWidgets.QTableWidgetItem(str(v)))
+        # Тикеты
+        t = self.db.admin_list_open_tickets()
+        self.table_tix.setRowCount(0)
+        for r in t:
+            i = self.table_tix.rowCount(); self.table_tix.insertRow(i)
+            self.table_tix.setItem(i, 0, QtWidgets.QTableWidgetItem(str(r['id'])))
+            self.table_tix.setItem(i, 1, QtWidgets.QTableWidgetItem(r['username']))
+            self.table_tix.setItem(i, 2, QtWidgets.QTableWidgetItem(r['subject']))
+            self.table_tix.setItem(i, 3, QtWidgets.QTableWidgetItem(r['message']))
+
+    def do_mod(self, act):
+        row = self.table_mod.currentRow()
+        if row < 0: return
+        kind = self.table_mod.item(row, 0).text()
+        mid = int(self.table_mod.item(row, 1).text())
+        self.db.moderate_message(self.admin_id, kind, mid, act)
+        self.refresh()
+
+    def reply_ticket(self):
+        row = self.table_tix.currentRow()
+        if row < 0: return
+        tid = int(self.table_tix.item(row, 0).text())
+        rep, ok = QtWidgets.QInputDialog.getMultiLineText(self, "Ответ", "Текст ответа:")
+        if ok and rep:
+            self.db.admin_reply_ticket(self.admin_id, tid, rep)
+            self.refresh()
+
+# ---------------------------- MAIN WINDOW & THEME ----------------------------
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.db = DB(DB_FILE)
+        self.setWindowTitle("WhatsApp 2.0")
+        self.resize(1100, 750)
+        
+        self.stack = QtWidgets.QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.auth = AuthPage(self.db)
+        self.home = UserHomePage(self.db)
+        self.admin = AdminHomePage(self.db)
+
+        self.stack.addWidget(self.auth)
+        self.stack.addWidget(self.home)
+        self.stack.addWidget(self.admin)
+
+        self.auth.logged_in.connect(self.on_login)
+        self.home.logout.connect(lambda: self.stack.setCurrentWidget(self.auth))
+        self.admin.logout.connect(lambda: self.stack.setCurrentWidget(self.auth))
+
+    def on_login(self, uid):
+        u = self.db.get_user_by_id(uid)
+        if u['is_admin']:
+            self.admin.set_admin(uid)
+            self.stack.setCurrentWidget(self.admin)
+        else:
+            self.home.set_user(uid)
+            self.stack.setCurrentWidget(self.home)
+
+def apply_whatsapp_theme(app):
+    app.setStyle("Fusion")
+    qss = """
+        QWidget { background-color: #0b141a; color: #e9edef; font-family: 'Segoe UI'; font-size: 14px; }
+        
+        /* Auth Card */
+        QFrame#AuthCard { background-color: #222e35; border-radius: 10px; padding: 20px; }
+        
+        /* Sidebar */
+        QFrame#SideHeader, QFrame#ChatHeader { background-color: #202c33; border: none; }
+        QListWidget#ChatList { background-color: #111b21; border: none; outline: none; }
+        QListWidget#ChatList::item { padding: 15px; border-bottom: 1px solid #222e35; }
+        QListWidget#ChatList::item:selected { background-color: #2a3942; color: white; }
+        
+        /* Messages */
+        QScrollArea#MsgScroll { border: none; background-color: #0b141a; }
+        QWidget#MsgScroll QWidget { background-color: transparent; }
+        
+        /* Input */
+        QFrame#InputBar { background-color: #202c33; border: none; }
+        QLineEdit { background-color: #2a3942; border: none; border-radius: 8px; padding: 8px; color: white; }
+        
+        /* Buttons */
+        QPushButton { background-color: #00a884; color: #111b21; border: none; border-radius: 5px; padding: 8px; font-weight: bold; }
+        QPushButton:hover { background-color: #06cf9c; }
+        
+        /* Tables (Admin) */
+        QTableWidget { background-color: #111b21; gridline-color: #222e35; }
+        QHeaderView::section { background-color: #202c33; color: #8696a0; border: none; padding: 5px; }
+    """
+    app.setStyleSheet(qss)
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    apply_whatsapp_theme(app)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
